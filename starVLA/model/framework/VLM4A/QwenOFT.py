@@ -214,18 +214,22 @@ class Qwenvl_OFT(baseframework):
     def predict_action(
         self,
         examples: List[dict] = None,
-        **kwargs: str,
+        profiler=None,
+        **kwargs,
     ) -> np.ndarray:
         """
-
         Steps:
           1. Resize images to training resolution (if specified)
           2. Encode with QwenVL (hidden states retained)
-          6. Return normalized action trajectory
+          3. Return normalized action trajectory
+
+        Args:
+            profiler: Optional InferenceProfiler. Times preprocessing, vlm_backbone,
+                      action_head, and total. Pass None (default) for zero overhead.
 
         Returns:
             dict:
-                normalized_actions (np.ndarray): Shape [B, T, action_dim], diffusion-sampled normalized actions.
+                normalized_actions (np.ndarray): Shape [B, T, action_dim].
         """
         if type(examples) is not list:
             examples = [examples]
@@ -251,8 +255,19 @@ class Qwenvl_OFT(baseframework):
         prompt_suffix = f" Please predict the next {self.chunk_len} robot actions: <action>{action_tokens}<action>."
         instructions = [instruction + prompt_suffix for instruction in instructions]
 
-        # Step 1: QWenVL input format
+        if profiler is not None:
+            profiler.time_start("total")
+
+        # Step 1: preprocessing (tokenization + input construction)
+        if profiler is not None:
+            profiler.time_start("preprocessing")
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
+        if profiler is not None:
+            profiler.time_end("preprocessing")
+
+        # Step 2: VLM backbone forward
+        if profiler is not None:
+            profiler.time_start("vlm_backbone")
         with torch.autocast("cuda", dtype=torch.bfloat16):
             qwenvl_outputs = self.qwen_vl_interface(
                 **qwen_inputs,
@@ -262,8 +277,12 @@ class Qwenvl_OFT(baseframework):
             )
             # last_hidden_state: [B, seq_len, H]
             last_hidden = qwenvl_outputs.hidden_states[-1]  # [B, L, H]
+        if profiler is not None:
+            profiler.time_end("vlm_backbone")
 
-        # Step 4: Action Expert Forward and Loss
+        # Step 3: Action head forward
+        if profiler is not None:
+            profiler.time_start("action_head")
         with torch.autocast("cuda", dtype=torch.float32):
             # Extract action token embeddings as action prediction queries
             input_ids = qwen_inputs.get("input_ids", None)
@@ -271,6 +290,11 @@ class Qwenvl_OFT(baseframework):
                 last_hidden, input_ids, action_token_id=self.action_token_id
             )  # [B, chunk_len, H]
             pred_actions = self.action_model.predict_action(action_queries)  # (B, chunk_len, action_dim)
+        if profiler is not None:
+            profiler.time_end("action_head")
+
+        if profiler is not None:
+            profiler.time_end("total")
 
         normalized_actions = pred_actions.detach().cpu().numpy()
         return {"normalized_actions": normalized_actions}
